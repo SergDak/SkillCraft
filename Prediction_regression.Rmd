@@ -1,0 +1,626 @@
+---
+title: "Starcraft Skill Data - Exploration"
+subtitle: "Linear Regression Model Selection"
+author: "Sergei Dakov"
+date: '2023-07-19'
+output: html_document
+---
+  
+The linear regression model is used in this case a quick and basic comparison baseline. To avoid claims of an unfair comparison we will perform the same model selection steps as all other models, thus giving the LR model a "fair chance"
+
+# Data Preparation
+
+Before we start, we load in required packages:
+```{r warning=FALSE,message=FALSE}
+library(tidyverse) # library containing tools for streamlining and tidying data processing
+library(rsample) #library for sampling and data splitting
+library(naniar) #library for visualization of missing data
+library(parsnip) #library for tidy model construction
+library(recipes) #library to easier manipulate data for model construction
+library(themis) #library for dealing with imbalances with artificial sampling
+library(yardstick) #functions o calculate metrics
+library(tune) #library that allows to tune multiple parameters at once
+```
+Next, load in some helper functions:
+
+```{r}
+source("model_selection_skeleton.r")
+```
+
+Finally, we load in the data:
+
+```{r}
+skillData <- read_csv("SkillCraft1_Dataset.csv") %>%
+  mutate(LeagueIndex = factor(LeagueIndex)) %>%
+  select(-c("Age","HoursPerWeek","TotalHours","GameID")) %>%
+  mutate(LeagueIndex = as.numeric(LeagueIndex))
+```
+Perform the initial split:
+
+```{r}  
+set.seed(1234)
+reg_split <- initial_split(skillData,strata = "LeagueIndex")
+regression_train <- training(reg_split)
+regression_test <- testing(reg_split)
+```
+As a baseline we use a simple LR model and get a prediction, and relevant metrics for this case.
+Note that the linear regression model is likley to provide a non whole value thus we need to round the values
+```{r}
+mod_glm <- glm(LeagueIndex~.,data=regression_train)
+predicted_guess <- predict(mod_glm,regression_test) %>% round()
+regression_test_round <- regression_test %>% cbind(guess = predicted_guess)
+regression_test_round  %>% mutate(hit = ifelse(guess==LeagueIndex,1,0)) %>% pull(hit) -> hits
+mean(hits)
+OnevRest(regression_test_round,truth = "LeagueIndex",guess = "guess")
+```
+The AUC is 0.61, and accuracy of the model is 0.397.
+
+Since there are multiple ways to round a number, we can test multiple cutoff points, and select the best performing one.
+```{r}
+predicted_guess <- predict(mod_glm,regression_test)
+results <- numeric()
+results_means <- numeric()
+for (i in seq(0,1,by=0.001)) {
+predicted_cut <- cutoff(predicted_guess,i)
+regression_test_cut <- regression_test %>% cbind(guess = predicted_cut)
+regression_test_cut  %>% mutate(hit = ifelse(guess==LeagueIndex,1,0)) %>% pull(hit) -> hits
+results<-c(results,OnevRest(regression_test_round,truth = "LeagueIndex",guess = "guess"))
+results_means <- c(results_means,mean(hits))
+}
+max(results)
+(which.max(results)-1)*0.001
+max(results_means)
+(which.max(results_means)-1)*0.001
+```
+For the AUC, all cutoffs offer the same degree of separation, thus we look to accuracy as a secondary measure.
+In this case the best cutoff is at 0.354, with an accuracy of 0.411.
+
+
+# Model Selection
+
+First, we need to re load the data, as we omitted some columns in the naive model:
+```{r}
+skillData <- read_csv("SkillCraft1_Dataset.csv") %>%
+  select(-Age) %>%
+  mutate(across(c("HoursPerWeek","TotalHours"),~as.numeric(.x)))
+glimpse(skillData)
+
+#New initial split
+set.seed(1234)
+reg_split <- initial_split(skillData,strata = "LeagueIndex")
+regression_train <- training(reg_split)
+regression_test <- testing(reg_split)
+
+mod_reg <- linear_reg(engine = "glmnet",penalty = 0.01)
+
+```
+
+training set has 2305 points, we propose the following split; since there are relatively few missing values.
+
+ -imbalance: 800
+ 
+ -missing Values: 445
+ 
+ -interactions: 1000
+ 
+ -hyper Parameters: 300
+ 
+ NOTE: many of the numeric variables are not normally distributed, we may apply the BoxCox transformation to normalize them, though log transform appears to be enough for some.
+ 
+```{r}
+split_sizes <- c("imbalance"=800,"interactions"=1000,"tuning"=300,"missing"=445)
+
+
+set.seed(1234)
+miss_split <- initial_split(regression_train,strata = "LeagueIndex",prop = (split_sizes["missing"]+2)/nrow(regression_train))
+train_miss <- training(miss_split)
+rest_split <- testing(miss_split)
+
+set.seed(1234)
+interaction_split <- initial_split(rest_split,strata="LeagueIndex",prop = ((split_sizes["interactions"])/nrow(rest_split)))
+train_interaction <- training(interaction_split)
+rest_split <- testing(interaction_split)
+
+set.seed(1234)
+imbalance_split <- initial_split(rest_split,strata="LeagueIndex",prop = ((split_sizes["imbalance"]+1)/nrow(rest_split)))
+train_imbalance <- training(imbalance_split)
+train_tuning <- testing(imbalance_split)
+```
+
+# Missing Values
+
+```{r}
+vis_miss(regression_train)
+```
+
+The main missing values come from one category- pro players, but not entirely.
+
+We could just assume each data point with missing data is a pro and drop the missing values or use it as an extra variable to help direct the model.
+
+```{r}
+# substitute the mean values in place of NAs, keep the data as is
+rec_mean_keep <- recipe(LeagueIndex~.,data=train_miss) %>%
+  step_rm(GameID)%>%
+  step_impute_mean(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# substitute the missing value using KNN, keep the data as is
+
+rec_knn_keep <- recipe(LeagueIndex~.,data=train_miss) %>%
+  step_rm(GameID)%>%
+  step_impute_knn(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# separate the rows with missing data into a separate category
+regression_train_sep <- train_miss %>% drop_na()
+regression_train_rest <- train_miss %>%
+  anti_join(regression_train_sep) %>%
+  select(LeagueIndex) %>%
+  mutate(cv_split = row_number()%%4+1)
+
+rec_separate <- recipe(LeagueIndex~.,data=regression_train_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# substitute the missing values with means, add an extra column to note which rows had missing values
+rec_mean_extra <- recipe(LeagueIndex~.,data=train_miss) %>%
+  step_rm(GameID)%>%
+  step_mutate(hadmissing = ifelse(is.na(TotalHours),1,0)) %>%
+  step_impute_mean(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()&!hadmissing)
+
+# substitute missing values with KNN, add an extra column to note which rows had missing values
+rec_knn_extra <- recipe(LeagueIndex~.,data=train_miss) %>%
+  step_rm(GameID)%>%
+  step_mutate(hadmissing = ifelse(is.na(TotalHours),1,0)) %>%
+  step_impute_knn(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()&!hadmissing)
+
+#drop all columns with missing values
+
+rec_drop <- recipe(LeagueIndex~.,data=train_miss) %>%
+  step_rm(GameID) %>%
+  step_rm(TotalHours,HoursPerWeek) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+Now we can perform cross-validation on each of the recipe and select the model with the best mean AUC:
+
+```{r}
+set.seed(100)
+cv_splits <- vfold_cv(train_miss,v=4,strata = 'LeagueIndex')
+
+set.seed(100)
+cv_splits_res <- vfold_cv(regression_train_sep,v=4,strata = 'LeagueIndex')
+
+
+lst_recs <- list("mean_keep" = rec_mean_keep,
+                 "knn_keep" = rec_knn_keep,
+                 "mean_extra" = rec_mean_extra,
+                 "knn_extra" = rec_knn_extra,
+                 "drop_drop" = rec_drop)
+                
+lst_recs_sep <- lst("drop_separate" = rec_separate)
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_reg)
+
+cv_splits_res <- calculate_splits_sep(cv_splits_res,lst_recs_sep,mod_reg,regression_train_rest)
+
+cv_splits <- cv_splits %>% full_join(cv_splits_res)
+
+cv_res_missing <- cv_splits %>% pivot_longer(cols=c(names(lst_recs),names(lst_recs_sep)),names_to = "recipe",values_to = "AUC")%>%
+  select(id,recipe,AUC) %>% separate(recipe,c("miss","row"))%>%
+  group_by(miss,row) %>% 
+  summarise (AUC = mean(AUC)) %>% arrange(-AUC)
+
+cv_res_missing
+```
+Dropping the columns with missing values, as well as singling out those rows as pro players performed the best (AUC of 0.666)
+
+
+# Imbalance
+
+```{r}
+regression_train %>% group_by(LeagueIndex) %>% summarise(n=n(),ratio = n()/nrow(regression_train))
+```
+
+The data is clearly unbalanced, possibly in accordance to the population distribution among the ranks.
+
+#Imbalance
+
+To deal with the imbalance of the data we have several approaches:
+
+- keeping the data as it is (this will be used as a baseline)
+
+- upsample (duplicate appearances of the sparse classes to increase their count)
+
+- downsample (remove instances of the over-represented classes to bring their number down)
+
+- SMOTE (synthetically generate new values for sparse classes by generating "in-between" values for all variables)
+
+- SMOTE with downsampling (lower the count of over-represented classes to decrease the ammount of artificial data introduced)
+
+```{r}
+train_imbalance_sep <- train_imbalance %>% drop_na()
+train_imbalance_rest <- train_imbalance %>% anti_join(train_imbalance_sep) %>% select(LeagueIndex) %>% mutate(cv_split = row_number()%%4+1)
+
+
+rec_upsample <- recipe(LeagueIndex~.,data=train_imbalance_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_upsample(imbalance,over_ratio = 1, seed = 123) %>%
+  step_rm(imbalance)
+
+rec_downsample <- recipe(LeagueIndex~.,data=train_imbalance_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio = 1,seed=123) %>%
+  step_rm(imbalance)
+
+rec_smote <- recipe(LeagueIndex~.,data=train_imbalance_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio=1.5,seed =123) %>%
+  step_smote(imbalance,over_ratio = 1,seed=123) %>%
+  step_rm(imbalance)
+
+rec_puresmote <- recipe(LeagueIndex~.,data=train_imbalance_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_smote(imbalance,over_ratio = 1,seed=123) %>%
+  step_rm(imbalance)
+
+rec_nothing <- recipe(LeagueIndex~.,data=train_imbalance_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_extra_upsample <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID)%>%
+  step_mutate(hadmissing = ifelse(is.na(TotalHours),1,0)) %>%
+  step_impute_knn(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()&!hadmissing) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_upsample(imbalance,over_ratio = 1, seed = 123) %>%
+  step_rm(imbalance)
+
+rec_extra_downsample <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID)%>%
+  step_mutate(hadmissing = ifelse(is.na(TotalHours),1,0)) %>%
+  step_impute_knn(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()&!hadmissing) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio = 1,seed=123) %>%
+  step_rm(imbalance)
+
+rec_extra_smote <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID)%>%
+  step_mutate(hadmissing = ifelse(is.na(TotalHours),1,0)) %>%
+  step_impute_knn(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()&!hadmissing) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio=1.5,seed =123) %>%
+  step_smote(imbalance,over_ratio = 1,seed=123,neighbors = 4) %>%
+  step_rm(imbalance)
+
+rec_extra_puresmote <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID)%>%
+  step_mutate(hadmissing = ifelse(is.na(TotalHours),1,0)) %>%
+  step_impute_knn(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()&!hadmissing) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_smote(imbalance,over_ratio = 1,seed=123,neighbors = 4) %>%
+  step_rm(imbalance)
+
+rec_extra_nothing <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID)%>%
+  step_mutate(hadmissing = ifelse(is.na(TotalHours),1,0)) %>%
+  step_impute_mean(everything()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()&!hadmissing)
+```
+
+Note - KNN with extra columns performed second best, so we test using it as well.
+
+```{r}
+set.seed(100)
+cv_splits_res <- vfold_cv(train_imbalance_sep,v=4,strata = 'LeagueIndex')
+
+set.seed(100)
+cv_splits <- vfold_cv(train_imbalance,v=4,strata = 'LeagueIndex')
+
+
+lst_recs_sep <- list("downsample" = rec_downsample,
+                     "upsample" = rec_upsample,
+                     "smote" = rec_smote,
+                     "pure_smote" = rec_puresmote,
+                     "nothing" = rec_nothing)
+lst_recs <- list("extra_upsample" = rec_extra_upsample,
+                 "extra_downsample" = rec_extra_downsample,
+                 "extra_smote" = rec_extra_smote,
+                 "extra_pure_smote" = rec_extra_puresmote,
+                 "extra_nothing"=rec_extra_nothing)
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_reg)
+
+cv_splits_res <- calculate_splits_sep(cv_splits_res,lst_recs_sep,mod_reg,train_imbalance_rest)
+
+cv_splits <- cv_splits %>% full_join(cv_splits_res)
+
+cv_res_imbalance <- cv_splits %>%
+  pivot_longer(cols=c(names(lst_recs_sep),names(lst_recs)),names_to = "recipe",values_to = "AUC") %>%
+  select(id,recipe,AUC) %>%
+  group_by(recipe) %>% 
+  summarise (AUC = mean(AUC)) %>% arrange(-AUC)
+
+cv_res_imbalance
+```
+The highest result is for down-sampling with an AUC of 0.669
+
+# Interactions and Feature Engineering
+
+First let us examine possibility of non linear relations:
+```{r}
+rec_unskew <- recipe(LeagueIndex~.,data=train_interaction) %>%
+  step_rm(GameID) %>%
+  step_naomit(everything(),skip = FALSE) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  prep()
+  
+linearity <- (sapply(colnames(train_imbalance[-2]),Linearity_test,dat=train_interaction,y="LeagueIndex"))
+bind_cols("column" = colnames(train_imbalance[-2]),"significance" = linearity) %>% arrange(-abs(significance)) %>% head(5) %>% pull(column) -> top_nonlinear
+
+train_interaction_sep <- train_interaction %>% drop_na()
+train_interaction_rest <- train_interaction %>% anti_join(train_interaction_sep) %>% select(LeagueIndex) %>% mutate(cv_split = row_number()%%4+1)
+
+
+
+
+
+rec_nothing <- recipe(LeagueIndex~.,data=train_interaction_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio = 1,seed=123) %>%
+  step_rm(imbalance)
+
+rec_bs <- recipe(LeagueIndex~.,data=train_interaction_sep) %>%
+  step_rm(GameID)%>%
+  add_role(all_of(top_nonlinear),new_role = "nonlinear") %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio = 1,seed=123) %>%
+  step_rm(imbalance) %>%
+  step_bs(has_role("nonlinear"))
+
+
+rec_ns <- recipe(LeagueIndex~.,data=train_interaction_sep) %>%
+  step_rm(GameID)%>%
+  add_role(all_of(top_nonlinear),new_role = "nonlinear") %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio = 1,seed=123) %>%
+  step_rm(imbalance) %>%
+  step_ns(has_role("nonlinear"))
+
+
+rec_poly <- recipe(LeagueIndex~.,data=train_interaction_sep) %>%
+  step_rm(GameID)%>%
+  add_role(all_of(top_nonlinear),new_role = "nonlinear") %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio = 1,seed=123) %>%
+  step_rm(imbalance) %>%
+  step_poly(has_role('nonlinear')) 
+
+```
+
+```{r warning=FALSE}
+set.seed(100)
+cv_splits_res <- vfold_cv(train_interaction_sep,v=4,strata = 'LeagueIndex')
+
+lst_recs_sep <- list("ns" = rec_ns,
+                 "bs" = rec_bs,
+                 "poly" = rec_poly,
+                 "nothing" = rec_nothing)
+
+
+cv_splits_res <- calculate_splits_sep(cv_splits_res,lst_recs_sep,mod_reg,train_imbalance_rest)
+cv_res_linearity <- cv_splits_res %>%
+  pivot_longer(cols=names(lst_recs_sep),names_to = "recipe",values_to = "AUC") %>%
+  select(id,recipe,AUC) %>%
+  group_by(recipe) %>% 
+  summarise (AUC = mean(AUC)) %>% arrange(-AUC)
+
+cv_res_linearity
+```
+Treating all parameters as linear lends the best results with AUC of 0.661
+
+# Interactions
+
+There may be interactions between some (or all) of the parameters, there are multiple ways to check:
+
+- hand picking predictors that may interact
+
+- checking for any significant interactions between all predictors
+
+
+Since we are testing a new facet of the data we can reuse old splits as well
+```{r}
+train_large_sep <- rbind(train_imbalance_sep,train_interaction_sep,regression_train_sep)
+train_large_rest <- rbind(train_imbalance_rest,train_interaction_rest,regression_train_rest)
+
+rec_nothing <- recipe(LeagueIndex~.,data=train_interaction_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_downsample(imbalance,under_ratio=1,seed =123) %>%
+  step_rm(imbalance)
+
+rec_handpicked <-recipe(LeagueIndex~.,data=train_interaction_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_interact(~APM:all_numeric_predictors()) %>%
+  step_nzv(all_numeric_predictors(),freq_cut = 99/1) %>%
+  step_downsample(imbalance,under_ratio=1,seed =123) %>%
+  step_rm(imbalance)
+
+
+rec_all_interact <- recipe(LeagueIndex~.,data=train_interaction_sep) %>%
+  step_rm(GameID)%>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_mutate(imbalance = factor(LeagueIndex)) %>%
+  step_interact(~all_numeric_predictors():all_numeric_predictors()) %>%
+  step_nzv(all_numeric_predictors(),freq_cut = 95/5) %>%
+  step_downsample(imbalance,under_ratio=1,seed =123) %>%
+  step_rm(imbalance)
+```
+
+```{r}
+set.seed(100)
+cv_splits_res <- vfold_cv(train_interaction_sep,v=4,strata = 'LeagueIndex')
+
+
+lst_recs_sep <- list("handpicked" = rec_handpicked,
+                     "all" = rec_all_interact,
+                     "nothing" = rec_nothing)
+
+
+cv_splits_res <- calculate_splits_sep(cv_splits_res,lst_recs_sep,mod_reg,train_imbalance_rest)
+cv_res_interact <- cv_splits_res %>%
+  pivot_longer(cols=names(lst_recs_sep),names_to = "recipe",values_to = "AUC") %>%
+  select(id,recipe,AUC) %>%
+  group_by(recipe) %>% 
+  summarise (AUC = mean(AUC)) %>% arrange(-AUC)
+
+cv_res_interact
+```
+
+No interactions performed the best (AUC of 0.661)
+
+
+
+
+# Tuning
+The hyper-parameters we can tune are:
+
+- the frequency cutoff
+
+- the down-sample ratio
+
+- the model penalty
+
+
+```{r}
+train_tuning_sep <- train_tuning %>% drop_na()
+train_tuning_rest <- train_tuning %>%
+  anti_join(train_tuning_sep) %>%
+  select(LeagueIndex) %>%
+  mutate(cv_split = row_number()%%4+1)
+
+set.seed(100)
+cv_splits_res <- vfold_cv(train_interaction_sep,v=4,strata = 'LeagueIndex')
+
+tuning_results <- tibble()
+
+for( penalty in seq(0,1,by=0.1)) {
+  for( freq_cut in c(99/1,95/5,97/3,90/10) ) { 
+    for (under_ratio in seq(0.5,1.5,by=0.1)) {
+
+
+model_tuning <- linear_reg(engine = "glmnet",penalty = penalty)
+
+    recipe_tuning <- recipe(LeagueIndex~.,data=train_tuning_sep) %>%
+        step_rm(GameID)%>%
+        step_YeoJohnson(all_numeric_predictors()) %>%
+        step_normalize(all_numeric_predictors()) %>%
+        step_mutate(imbalance = factor(LeagueIndex)) %>%
+        step_interact(~APM:all_numeric_predictors()) %>%
+        step_nzv(all_numeric_predictors(),freq_cut = freq_cut) %>%
+        step_downsample(imbalance,under_ratio=under_ratio,seed =123) %>%
+        step_rm(imbalance)
+    rec_tuning <- list(recipe_tuning)
+    names(rec_tuning) <- paste(penalty,freq_cut,under_ratio,sep="_")
+    cv_splits_current <- calculate_splits_sep(cv_splits_res,rec_tuning,
+                                              model_tuning,
+                                              train_tuning_rest)
+    tuning_results <- bind_rows(tuning_results,cv_splits_current)
+    }
+  }
+}
+
+tuning_results <- tuning_results %>% pivot_longer(cols = contains("_"),names_to = "recipe",values_to = "AUC") %>% drop_na()
+
+tuning_results %>% group_by(recipe) %>% summarize ("AUC" = mean(AUC)) %>% arrange(-AUC) %>% head(10)
+
+```
+There is a tie for best performing, in all cases the best option is to use a penalty of 0.1, and and sampling ratio of 1.4, the ratio for step_nzv does not matter significantly so we will use 99/1 attempt maintain the most data in the future.
+
+# Final Prediction
+```{r}
+regression_test_sep <- regression_test %>% drop_na()
+regressoin_test_rest <- regression_test %>%
+  anti_join(regression_test_sep) %>%
+  select(LeagueIndex) %>%
+  mutate("prediction"=8)
+regression_train_sep <- regression_train %>% drop_na()
+
+
+
+mod_final <- linear_reg(engine = "glmnet",penalty = 0)
+
+rec_final <- recipe(LeagueIndex~.,data=regression_train_sep) %>%
+        step_rm(GameID)%>%
+        step_YeoJohnson(all_numeric_predictors()) %>%
+        step_normalize(all_numeric_predictors()) %>%
+        step_interact(~APM:all_numeric_predictors()) %>%
+        step_nzv(all_numeric_predictors(),freq_cut = 99/1) %>%
+        step_mutate(imbalance = factor(LeagueIndex)) %>%
+        step_downsample(imbalance,under_ratio=1.4,seed =123) %>%
+        step_rm(imbalance) %>%
+        prep()
+
+train_final <- bake(rec_final,NULL)
+
+test_final <- bake(rec_final,new_data = regression_test_sep)
+fit_final <- fit(mod_final,as.numeric(LeagueIndex)~.,train_final)
+predicted_final <- predict(fit_final,test_final)
+predicted_final <- cutoff(predicted_final$.pred,0.354)
+predicted_final <- bind_cols("LeagueIndex" = regression_test_sep$LeagueIndex,"prediction"=predicted_final) %>% bind_rows(regressoin_test_rest)
+mean(predicted_final$prediction==predicted_final$LeagueIndex)
+OnevRest(predicted_final,"LeagueIndex","prediction")
+
+```
+The final model prediction had an One v Rest AUC of 0.69, and an accuracy of 0.411
+
+Save the model
+```{r}
+saveRDS(rec_final,"regression_model")
+```

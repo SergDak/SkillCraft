@@ -1,0 +1,502 @@
+---
+title: "Starcraft Skill Data - Exploration"
+subtitle: "Multinomial Regression Model Selection"
+author: "Sergei Dakov"
+date: 2023-07-20
+output: html_document
+---
+
+
+
+# Preparation
+
+First, load in required packages:
+
+```{r}
+library(tidyverse)
+library(rsample)
+library(parsnip)
+library(recipes)
+library(themis)
+library(glmnet)
+library(tune)
+library(yardstick)
+```
+
+Next, load in some helper functions:
+
+```{r}
+source("model_selection_skeleton.r")
+```
+
+Finally, we load in the data, some of the data has missing values so we drop these columns (since the logistic regression model cannot handle those):
+
+```{r}
+skillData <- read_csv("SkillCraft1_Dataset.csv") %>% select(-c('GameID','TotalHours','Age','HoursPerWeek')) %>% mutate(LeagueIndex = factor(LeagueIndex))
+```
+
+Split the data to produce a validation set:
+
+```{r}
+set.seed(1234)
+reg_split <- initial_split(skillData,strata = "LeagueIndex")
+regression_train <- training(reg_split)
+regression_test <- testing(reg_split)
+```
+
+Define the model to be used as baseline for the multinomial regression setting, and perform the initial split:
+
+```{r}
+mod_multi <- multinom_reg(mode="classification",penalty = 0.01,engine = "glmnet")
+
+fit_multi <- mod_multi %>% fit(LeagueIndex~.,data=regression_train)
+```
+
+
+```{r}
+predicted_guess <- predict(fit_multi,regression_test) %>% pull(.pred_class) #%>% as.numeric(.) %>% round(.)
+```
+
+Let's look at the AUC and accuracy for the initial prediction
+
+```{r}
+comp_trial <- cbind.data.frame(truth = regression_test$LeagueIndex,prediction = predicted_guess)
+comp_trial <- comp_trial %>% mutate(match = truth==prediction)
+mean(comp_trial$match)
+OnevRest(comp_trial,"truth","prediction")
+library(ggplot2)
+library(ggmosaic)
+comp_trial %>% ggplot() + geom_mosaic(aes(x=product(match,truth),fill=match))
+```
+For the AUC, the result for this model is 0.625, meaning the model struggles somewhat distinguishing between classes.
+The accuracy is 0.423, which while not very high is at least an improvement over the naive predictions.
+
+
+# Model Optimization
+
+To test the validity of the arbitrary decisions made in the benchmark model, we load in the data again (since one of those arbitrary decisions was dropping some columns).
+
+```{r}
+skillData <- read_csv("SkillCraft1_Dataset.csv") %>% mutate(LeagueIndex = factor(LeagueIndex)) %>% select(-Age) %>% mutate(across(c("HoursPerWeek","TotalHours"),~as.numeric(.x)))
+glimpse(skillData)
+```
+
+We can see the data has some missing values, and is quite unbalanced.
+
+These are things we will need to account for in model selection.
+
+```{r}
+library(naniar)
+vis_miss(skillData)
+
+skillData %>% ggplot() + geom_mosaic(aes(x=product(LeagueIndex),fill=LeagueIndex))
+```
+
+Perform the initial split again, we maintain the same seed so this split is identical to the previous one. This ensures the comparison is as fair as possible.
+
+```{r}
+set.seed(1234)
+reg_split <- initial_split(skillData,strata = "LeagueIndex")
+regression_train <- training(reg_split)
+regression_test <- testing(reg_split)
+```
+
+Conveniently all the data is numeric, so the main steps of model optimization are:
+
+ - dealing with NA
+ 
+ - rebalancing the data
+ 
+ - interactions
+ 
+ - tuning
+
+
+Dealing with interactions might require the most data points, while tuning is less significant.
+
+Missing values are somewhat rare but might have a significant effect (exploration of the data reveals most missing data comes from one specific class)
+
+```{r}
+split_sizes <- c("imbalance"=600,"interactions"=800,"tuning"=500,"missing"=645)
+
+
+set.seed(1234)
+miss_split <- initial_split(regression_train,strata = "LeagueIndex",prop = (split_sizes["missing"]+2)/nrow(regression_train))
+train_missing <- training(miss_split)
+rest_split <- testing(miss_split)
+
+set.seed(1234)
+interaction_split <- initial_split(rest_split,strata="LeagueIndex",prop = ((split_sizes["interactions"])/nrow(rest_split)))
+train_interaction <- training(interaction_split)
+rest_split <- testing(interaction_split)
+
+set.seed(1234)
+imbalance_split <- initial_split(rest_split,strata="LeagueIndex",prop = ((split_sizes["imbalance"]+1)/nrow(rest_split)))
+train_imbalance <- training(imbalance_split)
+train_tuning <- testing(imbalance_split)
+```
+# Imbalance:
+We will consider two possible approaches, imputing the missing date and noting in a separate column if the row was missing.
+
+We will do it the following ways:
+
+  - mean imputation
+  
+  - KNN imputation
+  
+  - dropping the columns with missing values
+  
+for the missing column the two options we will check is adding the columns or not.
+
+This in total gives us 6 models to compare at this stage, (doing nothing is not a viable course of action due to the fact a logistic regression model cannot handle missing values).
+```{r}
+rec_mean_nothing <- recipe(LeagueIndex~.,data=train_missing) %>%
+  step_rm(GameID) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_mean_extra <- recipe(LeagueIndex~.,data=train_missing) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_knn_nothing <- recipe(LeagueIndex~.,data=train_missing) %>%
+  step_rm(GameID) %>%
+  step_impute_knn(all_numeric()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_knn_extra <- recipe(LeagueIndex~.,data=train_missing) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_impute_knn(all_numeric()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_drop_nothing <- recipe(LeagueIndex~.,data=train_missing) %>%
+  step_rm(GameID,HoursPerWeek,TotalHours) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_drop_extra <- recipe(LeagueIndex~.,data=train_missing) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_rm(HoursPerWeek,TotalHours) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+We can now compare the performance of the different approaches by using cross-validation.
+
+since the data is somewhat thin, we will only do a 4-fold split as we do not want to stretch the data too thin
+(especially considering how sparse some of the classes are).
+
+```{r}
+set.seed(100)
+cv_splits <- vfold_cv(train_missing,v=4,strata = 'LeagueIndex')
+
+
+lst_recs <- list("mean_not" = rec_mean_nothing,
+                 "knn_not" = rec_knn_nothing,
+                 "mean_extra" = rec_mean_extra,
+                 "knn_extra" = rec_knn_extra,
+                 "drop_not" = rec_drop_nothing,
+                 "drop_extra" = rec_drop_extra)
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_multi)
+
+
+cv_res_missing <- cv_splits %>% pivot_longer(cols=c(names(lst_recs)),names_to = "recipe",values_to = "AUC")%>%
+  select(id,recipe,AUC) %>% separate(recipe,c("missing","column"))%>%
+  group_by(missing,column) %>% 
+  summarise (AUC = mean(AUC)) %>% arrange(-AUC)
+
+cv_res_missing
+```
+The best performing option is to impute the mean while noting which values were missing as a separate variable, leading with a ROC AUC of 0.817.
+
+
+# Imbalance
+
+To re-balance the data and deal with some of the sparsity we can resample the data.
+
+another option worth considering is SMOTE, which generates new synthetic values based on already existing values, but unfortunately the sparseness of some classes does not allow us to use this method.
+```{r}
+regression_train  %>% group_by(LeagueIndex) %>% summarise(n=n(),ratio = n()/nrow(regression_train))
+
+rec_nothing <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_upsample <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_upsample(LeagueIndex,over_ratio=1,seed=123) %>%
+  step_normalize(all_numeric_predictors())
+
+
+rec_downsample <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_downsample(LeagueIndex,under_ratio=1,seed=234) %>%
+  step_normalize(all_numeric_predictors())
+
+
+```
+
+Calculate the AUC for each approach:
+
+```{r}
+set.seed(100)
+cv_splits <- vfold_cv(train_imbalance,v=4,strata = 'LeagueIndex')
+
+
+lst_recs <- list("nothing" = rec_nothing,
+                 "upsample" = rec_upsample,
+                 "downsample" = rec_downsample
+                 )
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_multi)
+
+
+cv_res_imbalance <- cv_splits %>% pivot_longer(cols=c(names(lst_recs)),names_to = "recipe",values_to = "accuracy")%>%
+  select(id,recipe,accuracy) %>%
+  group_by(recipe) %>% 
+  summarise (accuracy = mean(accuracy)) %>% arrange(-accuracy)
+
+cv_res_imbalance
+```
+Upsampling provides the best result, with an AUC of 0.823.
+
+System warnings also inform us that the sparsity of the classes is indeed harming the model in non-upsampling modes.
+
+Note that the data does not fulfill normality assumption, we can attempt to fix this by using a Yeo-Johnson transformation, and compare the results to confirm whether it is significant.
+
+```{r}
+rec_nothing_yeo <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_downsample_yeo <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_downsample(LeagueIndex,under_ratio=1,seed=234)
+
+rec_upsample_yeo <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_upsample(LeagueIndex,over_ratio=1,seed=123) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_smote_yeo <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_downsample(under_ratio= 1.5, seed = 11) %>%
+  step_smotenc(over_ratio = 1, seed = 111)
+
+
+set.seed(100)
+cv_splits <- vfold_cv(train_imbalance,v=4,strata = 'LeagueIndex')
+
+
+lst_recs <- list("nothing" = rec_nothing,
+                 "nothing_yeo" = rec_nothing_yeo,
+                 "downsample" = rec_downsample,
+                 "upsample_yeo" = rec_upsample_yeo,
+                 "downsample_yeo" = rec_downsample_yeo,
+                 "upsample" = rec_upsample)
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_multi)
+
+
+cv_res_imbalance <- cv_splits %>% pivot_longer(cols=c(names(lst_recs)),names_to = "recipe",values_to = "accuracy")%>%
+  select(id,recipe,accuracy) %>%
+  group_by(recipe) %>% 
+  summarise (accuracy = mean(accuracy)) %>% arrange(-accuracy)
+
+cv_res_imbalance
+```
+When also accounting for Yeo Johnoson transformation, we can see that it does improve the model performance.
+The upsample method still is best performing (AUC of 0.839). 
+
+# Interactions
+The multinomial model does not inherently deal with interactions between predictors, since some of the parameters might be linked we can test whether there are any significant interactions we need to account for.
+
+
+We will do it the following way:
+
+- he no interaction model will be the base line to compare to
+
+- some interactions seem naturally appealing, we can handpick some interactions and check only those (in this case we will use the interactions of APM with everything else)
+
+- we can account for all interactions, then filter out all predictors which have too low of a variance as to not overwhelm the model (thus overfit the data)
+
+```{r}
+rec_nothing <- recipe(LeagueIndex~.,data=train_interaction) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_upsample(LeagueIndex,over_ratio = 1,seed = 112)
+
+rec_handpicked <- recipe(LeagueIndex~.,data=train_interaction) %>%
+  step_rm(GameID) %>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_interact(~APM:all_numeric_predictors()) %>%
+  step_nzv(all_numeric_predictors(),freq_cut = 99/1) %>%
+  step_normalize(all_numeric_predictors())%>%
+  step_upsample(LeagueIndex,over_ratio = 1,seed = 112)
+
+rec_all_interact <- recipe(LeagueIndex~.,data=train_interaction) %>%
+  step_rm(GameID)%>%
+  step_mutate(missing_total=is.na(TotalHours)) %>%
+  step_mutate(missing_weekly=is.na(HoursPerWeek)) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_interact(~all_numeric_predictors():all_numeric_predictors()) %>%
+  step_nzv(all_numeric_predictors(),freq_cut = 95/5) %>%
+  step_upsample(LeagueIndex,over_ratio = 1,seed = 112)
+
+rec_expand <- recipe(LeagueIndex~.,data=train_interaction) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_upsample(LeagueIndex,over_ratio = 0.2,seed=112) %>%
+  prep()
+
+train_interaction_big <-rec_expand %>% bake(new_data=NULL)
+```
+
+
+```{r}
+set.seed(100)
+cv_splits<- vfold_cv(train_interaction,v=4,strata = 'LeagueIndex')
+
+
+lst_recs <- list("handpicked" = rec_handpicked,
+                     "all" = rec_all_interact,
+                     "nothing" = rec_nothing
+                     )
+
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_multi)
+cv_res_interact <- cv_splits %>%
+  pivot_longer(cols=names(lst_recs),names_to = "recipe",values_to = "AUC") %>%
+  select(id,recipe,AUC) %>%
+  group_by(recipe) %>% 
+  summarise (AUC = mean(AUC)) %>% arrange(-AUC)
+
+cv_res_interact
+
+```
+no interactions is best performing (AUC 0.857).
+
+
+# Tuning:
+The hyper-parameters that we can further tune are:
+
+  - the complexity penalty for the model
+  
+  - the mixture parameter for the elastic net
+  
+  - the ratio up to which we are going to be upsamling the sparse classes to
+  
+Since we will be testing each combination of these hyper-parameters, this step roughly 850 different models, thus this step is noticeably slow and takes time to complete.
+
+```{r}
+set.seed(100)
+cv_splits <- vfold_cv(train_tuning,v=4,strata = 'LeagueIndex')
+
+penalty <- seq(6,0,length=7)
+mixture <- seq(0,1,by=0.1)
+ratio <- seq(0.5,1.5,len=11)
+tuning_vars <- expand.grid("penalty"=penalty
+                           ,"mixture"=mixture
+                           ,"over_ratio"=ratio
+)
+
+
+mod_multi_tuning <- multinom_reg(mode="classification",engine = "glmnet",penalty = tune(),mixture = tune())
+
+recipe_tuning <- recipe(LeagueIndex~.,data=train_tuning) %>%
+  step_rm(GameID)%>%
+  step_mutate(missing_total=as.numeric(is.na(TotalHours))) %>%
+  step_mutate(missing_weekly=as.numeric(is.na(HoursPerWeek))) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_upsample(LeagueIndex,over_ratio = tune(),seed = 112)
+
+formula_res <- mod_multi_tuning %>% tune_grid(object = mod_multi_tuning,
+                                              preprocessor = recipe_tuning,
+                                              resamples = cv_splits,
+                                              metrics = metric_set(roc_auc),
+                                              grid = tuning_vars
+)
+
+col_metric <- collect_metrics(formula_res)
+
+col_metric %>% arrange(-mean) %>% head(10)
+```
+The best results were - using an unpenalized model, with no mixture, and and oversampling ratio of 1.5, with an AUC of 0.833.
+
+# Final Prediction:
+
+```{r}
+mod_multi_final <- multinom_reg(mode="classification",engine = "glmnet",penalty=0)
+  
+rec_final <- recipe(LeagueIndex~.,data=regression_train) %>%
+  step_rm(GameID)%>%
+  step_mutate(missing_total=as.numeric(is.na(TotalHours))) %>%
+  step_mutate(missing_weekly=as.numeric(is.na(HoursPerWeek))) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  #step_upsample(LeagueIndex,over_ratio = 1.5,seed = 112) %>%
+  prep()
+
+fit_final <- rec_final %>% bake(new_data=NULL)
+fit_final <- fit(mod_multi_final,LeagueIndex~.,fit_final)
+pred_final <- predict(fit_final,new_data=bake(rec_final,new_data=regression_test),type="prob")
+pred_final <- pred_final %>% mutate(truth = regression_test$LeagueIndex)
+pred_guess <- predict(fit_final,new_data=bake(rec_final,new_data=regression_test))
+pred_final <- pred_final %>% mutate(estimate = pred_guess$.pred_class)
+roc_auc(pred_final,"truth",starts_with(".pred"))
+accuracy(pred_final,"truth","estimate")
+```
+The final optimized model has an AUC of 0.878, and an accuracy of 0.397.
+
+Of note is that the model selection process has not improved prediction quality by much, it is possible that due to the low ammount of data and sparse data the optimization process was mislead by poorly representative data.
+
+If we ignore some of the guidance from the optimization process (specifically the upsampling)
+we get an AUC of 0.875, accuracy of 0.455.
+
+```{r}
+saveRDS(rec_final,"multinomial_model")
+```

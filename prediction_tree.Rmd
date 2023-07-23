@@ -1,0 +1,270 @@
+---
+title: "Starcraft Skill Data - Exploration"
+subtitle: "Tree Model Selection"
+author: "Sergei Dakov"
+date: '2023-07-19'
+output: html_document
+---
+
+# Preparing The Data
+
+
+First, load in the libraries used in model selection:
+
+```{r warnings=FALSE, message=FALSE}
+library(tidyverse)
+library(rsample)
+library(parsnip)
+library(recipes)
+library(themis)
+library(glmnet)
+library(ggplot2)
+library(ggmosaic)
+library(yardstick)
+
+```
+
+Second, load in some helper functions:
+
+```{r}
+source("model_selection_skeleton.r")
+```
+
+
+Next, load in the data.
+
+Some changes need to be made to be data so the model selection process works, such as converting the LeagueIndex column to a factor, and removing the age variable (as it is not a measurable metric by the game).
+
+```{r}
+
+
+skillData <- read_csv("SkillCraft1_Dataset.csv") %>%
+  mutate(LeagueIndex = factor(LeagueIndex)) %>%
+  select(-Age) %>%
+  mutate(across(c("HoursPerWeek","TotalHours"),~as.numeric(.x)))
+```
+
+Visualize missing data:
+
+```{r}
+library(naniar)
+vis_miss(skillData)
+```
+
+Define the initial model:
+
+```{r}
+mod_tree <- decision_tree(mode="classification",cost_complexity = 0.01)
+```
+
+Perform the initial split:
+
+```{r}
+set.seed(1234)
+reg_split <- initial_split(skillData,strata = "LeagueIndex")
+regression_train <- training(reg_split)
+regression_test <- testing(reg_split)
+```
+
+As a baseline we will fit the data using the initial model, to assess the efficiency of the optimization process.
+
+```{r}
+fit_tree <- mod_tree %>% fit(LeagueIndex~.,regression_train)
+pred_tree <- predict(fit_tree,regression_test,type="prob")
+pred_tree <- pred_tree %>% cbind(truth = regression_test$LeagueIndex)
+roc_auc(pred_tree,"truth",starts_with(".pred"))
+
+guess_tree <- predict(fit_tree,regression_test)
+pred_tree <- pred_tree %>% cbind(guess = guess_tree$.pred_class)
+accuracy(pred_tree,"truth","guess")
+```
+In the basic scenario the result of the model is an AUC is 0.831, which is slightly worse than the logistic regression model.
+
+The accuracy is 0.387, also somewhat lower than  the regression model.
+
+```{r}
+pred_tree <- pred_tree %>% mutate(match = (truth==guess))
+pred_tree %>% ggplot() + geom_mosaic(aes(x=product(match,truth),fill=match))
+```
+
+In this model case the tree model successfully identifies the 8th class (pro players) butt struggles more with some of the middle classes, a major difference being the prediction quality in class 5.
+
+# Model Selection
+
+First, preform the splits to independently optimize every element of the model, We select the splits to favor handling component ananlysis followed by class imbalance.
+
+```{r}
+split_sizes <- c("imbalance"=900,"tuning"=644,"components"=1000)
+
+
+set.seed(123)
+imbalance_split <- initial_split(regression_train,strata="LeagueIndex",prop = ((split_sizes["imbalance"])/nrow(regression_train)))
+train_imbalance <- training(imbalance_split)
+rest_split <- testing(imbalance_split)
+
+set.seed(234)
+tuning_split <- initial_split(rest_split,strata="LeagueIndex",prop=((split_sizes["tuning"])/nrow(rest_split)))
+train_tuning <- training(tuning_split)
+train_components <- testing(tuning_split)
+```
+
+Since trees do not suffer from the presence of missing values, we do not have to impute any data, but since trees might be weak to class imbalance we will test to see if re-sampling of the data can bring out effects drowned out due to sparsity.
+
+```{r}
+rec_nothing <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID)
+
+rec_upsample <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_upsample(LeagueIndex,over_ratio=1,seed=111)
+
+rec_downsample <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_downsample(LeagueIndex,under_ratio = 1,seed=111)
+
+rec_smote <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_impute_mean(all_predictors()) %>%
+  step_downsample(LeagueIndex,under_ratio = 1.5,seed = 111)%>%
+  step_smotenc(LeagueIndex,over_ratio = 1,seed=111)
+
+rec_puresmote <- recipe(LeagueIndex~.,data=train_imbalance) %>%
+  step_rm(GameID) %>%
+  step_impute_mean(all_predictors()) %>%
+  step_smotenc(LeagueIndex,over_ratio = 1,seed =111)
+
+set.seed(100)
+cv_splits <- vfold_cv(train_imbalance,v=5,strata = 'LeagueIndex')
+
+
+lst_recs <- list("nothing" = rec_nothing,
+                 "upsample" = rec_upsample,
+                 "downsample" = rec_downsample,
+                 "smote" = rec_smote,
+                 "only_smote" = rec_puresmote
+)
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_tree)
+
+
+cv_res_imbalance <- cv_splits %>% pivot_longer(cols=c(names(lst_recs)),names_to = "recipe",values_to = "AUC")%>%
+  select(id,recipe,AUC) %>%
+  group_by(recipe) %>% 
+  summarise (AUC = mean(AUC)) %>% arrange(-AUC)
+
+cv_res_imbalance
+```
+
+The best result is using SMOTE to re-balance the classes, with an AUC of 0.81.
+
+
+Tree models naturally consider interactions due to its tiered structure, but sometimes the model may over-fit due to the many features, we can lower this effect by lowering dimensionality.
+```{r}
+library(tune)
+
+set.seed(100)
+cv_splits <- vfold_cv(train_components,v=5,strata = 'LeagueIndex')
+
+components <- c(seq(5,10,by=1),18)
+components <- cbind.data.frame("num_comp" = components)
+
+
+
+
+recipe_components <- recipe(LeagueIndex~.,data=train_components) %>%
+  step_rm(GameID) %>%
+  step_impute_mean(all_predictors()) %>%
+  step_smotenc(LeagueIndex,over_ratio = 1,seed=111) %>%
+  step_pca(all_predictors(),num_comp = tune())
+
+formula_res <- mod_tree %>% tune_grid(object = mod_tree,
+                                              preprocessor = recipe_components,
+                                              resamples = cv_splits,
+                                              metrics = metric_set(roc_auc),
+                                              grid = components
+                                      )
+
+col_metric <- collect_metrics(formula_res)
+
+col_metric %>% arrange(-mean) %>% head(10)
+
+lst_recs <- list("nothing" = rec_nothing)
+
+cv_splits <- calculate_splits(cv_splits,lst_recs,mod_tree)
+
+cv_res_components <- cv_splits %>% pivot_longer(cols=c(names(lst_recs)),names_to = "recipe",values_to = "AUC")%>%
+  select(id,recipe,AUC) %>%
+  group_by(recipe) %>% 
+  summarise (AUC = mean(AUC)) %>% arrange(-AUC)
+
+cv_res_components
+```
+
+Reducing the dimensions to 7 or 9 primary components has the best performance, keeping 7 components will make model fitting faster thus we choose it.
+
+ AUC of 0.776 compared to AUC of 0.756 when not performing PCA.
+ 
+When attempting to perform smote: 5,6,7 components performed the same, but smote failed due to lack of observations of certain classes in some cases.
+
+# Tuning
+
+We can tune the parameters of the tree, as well as parameters of pre-processing.
+```{r}
+set.seed(100)
+cv_splits <- vfold_cv(train_components,v=5,strata = 'LeagueIndex')
+
+tune_values <- expand.grid("over_ratio"=seq(0.5,1.5,by=0.1),"cost_complexity"=c(seq(0,1,by=0.1),2:5))
+
+
+mod_tuning <- decision_tree(mode="classification",cost_complexity = tune())
+
+recipe_tuning <- recipe(LeagueIndex~.,data=train_components) %>%
+  step_rm(GameID) %>%
+  step_impute_mean(all_predictors()) %>%
+  step_smotenc(LeagueIndex,over_ratio = tune(),seed=111) %>%
+  step_pca(all_predictors(),num_comp = 7)
+
+formula_res <-tune_grid(object = mod_tuning,
+                        preprocessor = recipe_tuning,
+                        resamples = cv_splits,
+                        metrics = metric_set(roc_auc),
+                        grid = tune_values
+                        )
+
+col_metric <- collect_metrics(formula_res)
+
+col_metric %>% arrange(-mean) %>% head(10)
+
+```
+
+The best performing option is a non-penalized model with a ratio of 1:1 in SMOTE generation.
+
+# Final prediction.
+```{r}
+recipe_final <- recipe(LeagueIndex~.,data=regression_train) %>%
+  step_rm(GameID) %>%
+  step_impute_mean(all_predictors()) %>%
+  step_smotenc(LeagueIndex,over_ratio = 1,seed=111) %>%
+  step_pca(all_predictors(),num_comp = 7) %>%
+  prep()
+
+train_final <- bake(recipe_final,new_data = NULL)
+test_final <- bake(recipe_final,new_data = regression_test)
+
+fit_final <- fit(mod_tree,LeagueIndex~.,train_final)
+prob_final <- predict(fit_final,new_data = test_final,type = "prob")
+pred_final <- predict(fit_final,new_data= test_final)
+
+res_final <- prob_final %>% mutate(truth=test_final$LeagueIndex,guess = pred_final$.pred_class)
+roc_auc(res_final,"truth",starts_with(".pred"))
+accuracy(res_final,"truth","guess")
+```
+
+Using the resulting model gives a worse prediction than the initial model, so we revert back to it. 
+The model brings us to a final AUC of 0.835, and accuracy of 0.317.
+
+Finally, save the model to access it from the main file:
+
+```{r}
+saveRDS(recipe_final,"tree_model")
+```
